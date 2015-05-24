@@ -1,0 +1,368 @@
+---
+title: "Human Activity Recognition - a practical approach"
+author: "max65"
+date: "May 24 2015"
+output: html_document
+---
+```{r global_options, include=FALSE}
+options(width=120)
+knitr::opts_chunk$set(fig.width=8, fig.height=6, fig.path='Figs/',                     
+                      echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+###Executive Summary
+
+This report describes the construction and evaluation of some models used to identify the manner how a physical exercise is performed on the basis of several observed/measured features of the performance itself.
+
+The final aim is to select and apply the model that better predicts the outcome for 20 testing cases.
+
+### Introduction
+The data for this project come from a research about "Qualitative Activity Recognition"  performed by a group of Brasilian researchers (ref. http://groupware.les.inf.puc-rio.br/har).
+Each observation refers to the measurements taken during the controlled execution of dumbbell lifts by one of the six participants involved in the research: the outcome variable "classe" contains the evaluation of how the exercise was performed (A = exactly according to the specification; B = throwing the elbows to the front; C= lifting the dumbbell only halfway; D= lowering the dumbbell only halfway; E= throwing the hips to the front).
+
+###Exploratory analysis
+
+```{r loading library and data}
+library(caret)
+library(tree)
+library(rpart)
+library(randomForest)
+library(plotrix)
+
+all_training<-read.csv("pml-training.csv", header = TRUE, stringsAsFactors=TRUE)
+testing<-read.csv("pml-testing.csv", header = TRUE, stringsAsFactors=TRUE)
+
+```
+
+The training dataset is made of `r dim(all_training)[1]` observations with `r dim(all_training)[2]` variables each. The outcome is contained in the categorical variable "classe".
+
+The variables "`r names(all_training)[c(1,3:7)]`" are very related to the specific trial execution and are not considered as useful for a generalized model to be applied  to more general circumstances. Hence these variables are removed from the training and testing datasets.
+
+```{r exploratory analysis1}
+
+## remove from training and testing dataframe the columns 1 and 3:7 related to variables that cannot
+## be significant for predicting future outcomes based on completely different observations
+all_training<-all_training[,-c(1,3,4,5,6,7)]
+testing<-testing[,-c(1,3,4,5,6,7)]
+
+## identify columns of training dataset with more than x percent NA values
+xperc<-0.75
+var_xperc_NA_train<-sapply(1:dim(all_training)[2], function(w) {ifelse(mean(is.na(all_training[,w]))>xperc, w, 0)})
+var_xperc_NA_train<-var_xperc_NA_train[var_xperc_NA_train!=0]
+num_col_NAs<-length(var_xperc_NA_train) ## count how many vars contain more than xperc 
+```
+
+In the training set there are `r num_col_NAs` columns with more than `r paste(100*xperc, "%", sep="")` of NA values; these columns are 100% NAs in the testing set. Therefore also these columns are removed from the training and testing sets, because of scarse significance.
+
+```{r exploratory analysis2}
+## remove from all_training and testing dataset the vars that in training have more than xperc NAs
+all_training<-all_training[,-var_xperc_NA_train]
+testing<-testing[,-var_xperc_NA_train]
+
+## identify columns of testing dataset with only NA values
+var_all_NA_test<-sapply(1:dim(testing)[2], function(w) {ifelse(all(is.na(testing[,w])), w, 0)})
+var_all_NA_test<-var_all_NA_test[var_all_NA_test!=0]
+num_col_NAs<-length(var_all_NA_test) ## count how many vars contain only NA values
+
+```
+
+Moreover the testing set contains other `r num_col_NAs` columns with only NAs: also these colums are removed from both the training and the testing set, making lighter the effort to run the models.
+
+```{r exploratory analysis3}
+## keep in training and testing dataframes only the columns that are not all NAs in reduced testing dataset
+all_training<-all_training[,-var_all_NA_test]
+testing<-testing[,-var_all_NA_test]
+```
+Having removed all these columns the percentage of NAs in the trainig set is `r mean(is.na(all_training))` and the new dimensions of the training and testing sit are `r dim(all_training)`.
+
+The original training data set is then split into two subsets: an effective training set (with 80% of observations) and a validation set (with 20% of observations), that will be used respectively to build the models and to evaluate their "out-of-sample" error rate.
+
+```{r exploratory analysis4}
+inTrain<-createDataPartition(all_training$classe, p=.8, list=FALSE)
+training<-all_training[inTrain,]
+validation<-all_training[-inTrain,]
+```
+
+
+### Models building
+
+Three different families of algorithms for classification tree are considered, based on the following packages:
+
+a) tree
+b) rpart
+c) randomForest
+
+Typically more than one model from each family is created. Before the construction of each model the set.seed(2811) command is given.
+
+To compare the results obtained a dataframe called "results" is initialized, where the main characteristics of each model are reported, including the accuracy ("---Acc") calculated on both the training set (in-the-sample) and on the validation set (out-of-sample), accompanied by the lower ("---AccL") and upper value (---AccU) of the confidence interval. A measure of complexity is contained in colums: "Dim" (the number of leaves for tree and the number of forests for random forests) and "Time" (the "user.self" info obtained from system.time command).
+
+The results are presented all together in the "Results" section.
+
+
+``` {r initialization}
+results<- data.frame(
+                Type=character(),
+                modName=character(),
+                Dim=integer(),
+                VarsImp=integer(),
+                Time=numeric(),
+                TrAcc=numeric(),
+                TrAccL=numeric(),
+                TrAccU=numeric(),
+                ValAcc=numeric(),
+                ValAccL=numeric(),
+                ValAccU=numeric(),
+                rownames=NULL
+            )
+
+## the function "storeResults" copes with the different syntax of the different functions/models 
+storeResults<-function(usedModel, currModel, name, elapsed)
+    {
+
+    if(usedModel!="gbm") ## it can be tree, rpart, RF
+        {predType="class"
+         if(usedModel=="tree"){
+             num_nodes<-summary(currModel)$size
+             numVars<-length(summary(currModel)$used)
+             }
+         else{
+            if(usedModel=="rpart"){
+                 num_nodes<-currModel$cp[dim(currModel$cp)[1], "nsplit"]+1
+                 numVars<-length(currModel$variable.importance)
+                 }
+            else {
+                 num_nodes<-as.integer(summary(currModel)["forest",1])
+                 numVars<-dim(varImp(currModel))[1]
+                 }
+            }
+        }
+    else
+        {predType="raw"
+         num_nodes<-1}         
+         
+    AccTrain<-confusionMatrix(training$classe,
+                              predict(currModel, newdata=training, type=predType))[[3]]
+    AccValid<-confusionMatrix(validation$classe,
+                              predict(currModel, newdata=validation, type=predType))[[3]]
+        
+    results<<-rbind(results,
+                    data.frame(
+                    Type=usedModel,
+                    modName=name,
+                    Dim=num_nodes,
+                    VarsImp=numVars,
+                    Time=elapsed,
+                    TrAcc=round(AccTrain["Accuracy"], 5),
+                    TrAccL=round(AccTrain["AccuracyLower"], 5),
+                    TrAccU=round(AccTrain["AccuracyUpper"], 5),
+                    ValAcc=round(AccValid["Accuracy"], 5),
+                    ValAccL=round(AccValid["AccuracyLower"], 5),
+                    ValAccU=round(AccValid["AccuracyUpper"], 5)))
+    rownames(results)<<-NULL
+    }
+```
+
+
+####"tree" package
+
+The first tree is built using the tree() function on the training set with all the predictors: the following figure represents the result.
+
+```{r use_of_tree, fig.height=4, fig.width=10}
+set.seed(2811)
+
+## first model using "tree"" package
+time<-system.time(HQAR_tree <- tree(classe ~., data=training))
+storeResults("tree", HQAR_tree, "basic", time["user.self"])
+
+## layout(matrix(c(1,2),nrow=2), heights = c(2,1))
+par(mar=c(1,1,3,1))
+plot(HQAR_tree)
+text(HQAR_tree, pretty =0, cex=0.6)
+title("classification tree")
+```
+
+The following table reports (in reverse order by total number of leaves) the misclassification error levels associated to each of the subtrees obtained pruning the principal tree, that is the best one.
+
+```{r use_of_tree_cv}
+
+## perform cv to determine the optimal level of complexity of the model HQAR_tree_1
+cv_HQAR_tree <- cv.tree(HQAR_tree ,FUN=prune.misclass)
+errors<-matrix(round(cv_HQAR_tree$dev/dim(training)[1],3), nrow=1,byrow = T )
+colnames(errors)<-round(cv_HQAR_tree$size,0)
+errors
+
+```
+
+The characteristics of this model are:
+
+```{r}
+results[1,]
+```
+
+The best tree identified by the function "tree" has a quite limited number of nodes and a "crossvalidated" misclassification rate of `r paste(100*errors[1], "%", sep="")`, quite high, but less than half of the `r paste(100*errors[length(errors)], "%", sep="")` presented by the trivial subtree (root) that predicts always "A".
+
+
+####"rpart" package
+
+A first model of this family is built calling the "rpart" function with the default parameters and using all the predictors; a second model is then obtained customizing some of the parameters that most affect the results (in particular the "minsplit", taken as $\sqrt{p}$ where p is the number of observations, and the "cp" - complexity parameter - set at 0.001) in order to achieve better prediction capability.
+
+```{r use_of_rpart1}
+set.seed(2811)
+## use default control parameters
+time<-system.time(HQAR_rpart <- rpart(classe ~., data=training, method="class"))
+storeResults("rpart", HQAR_rpart, "default", time["user.self"])
+
+set.seed(2811)
+## use customized parameters
+ctrl_rpart<-rpart.control(xval = 15, minsplit=round(sqrt(dim(training)[1]),0), cp=0.001,maxsurrogate=2)
+time<-system.time(HQAR_rpartCust <- rpart(classe ~., data=training, method="class",control = ctrl_rpart))
+storeResults("rpart", HQAR_rpartCust, "custom", time["user.self"])
+```
+
+The characteristics of these two model are:
+
+```{r}
+results[2:3,]
+```
+
+As shown in the plot below, the "rpart" function produces far better results respect to the "tree" function, at the cost of additional complexity represented by the greater number of nodes and of variables used to build the model. Calling "rpart" with customized parameters increases the accuracy and, even if more complex, the "rpart-custom" model seems not to suffer of "overfitting" as shown by calculating the "out-of-sample" accuracy ("ValAcc") on the "validation" set.
+
+
+```{r use_of_rpart2, fig.height=4, fig.width=8}
+plotcp(HQAR_rpartCust) ## the plot shows the optimal place to prune the tree
+```
+
+
+####"randomForest" package
+
+Three models of different classes from this family are considered:
+
+i) the first one is of the "bagging" kind, whith all the predictors available for selection at each split;
+
+ii) the second one is a real Random Forest, with only m = $\sqrt{p}$ predictors available at each split;
+
+iii) the third one - exploited in 5 subcases - is a real Random Forest as the second one, but the predictors passed to the function are reduced to those whose "importance" in the second model lies above a specific percentile value (0.3, 0.45, 0.6, 0.75, 0.9). This models are considered in order to check whether reducing the number of predictors only to the most relevant ones the accuracy remains still acceptable (the answer will be yes).
+
+
+```{r use_of_rf}
+## start with bagging i.e. m=p
+set.seed(2811)
+p<-dim(training)[2]-1 ## number of predictors ("classe"" is not a predictor)
+time<-system.time(HQAR_bagging<-randomForest(classe ~., method="class",
+                           mtry=p, data=training, importance =TRUE))
+storeResults("RF", HQAR_bagging, "bagging", time["user.self"])
+```
+
+```{r use_of_rf2}
+## proceed with real rf i.e. m=sqrt(p)
+set.seed(2811)
+m<-round(sqrt(p),0)
+time<-system.time(HQAR_rf<-randomForest(classe ~., method="class",
+                           mtry=m, data=training, importance =TRUE))
+storeResults("RF", HQAR_rf, "randomF", time["user.self"])
+
+## try with a reduced set of predictors and apply rf i.e. m=sqrt(p)
+soglie<-seq(0.30, 0.9, by = 0.15)
+HQAR_rf_reduced<-vector("list", 5)
+
+for(i in seq_along(soglie)){
+    ## selection of predictors based on the varImp of rf model
+    ## taken the predictors whose average varImp across the 5 classes is
+    ## above the 50th percentile of the varImp averages
+    set.seed(2811)
+    threshold<-round(quantile(apply(varImp(HQAR_rf), 1, mean), soglie[i]),0)
+    list_of_predictors<-names(which(apply(varImp(HQAR_rf), 1, mean)>threshold))
+    predictors<-list_of_predictors[1]
+    a<-sapply(list_of_predictors[-1],
+              function(w) {predictors<<-paste(predictors, w, sep="+")})
+    rm(a)
+    m<-round(sqrt(length(list_of_predictors)),0)
+    set.seed(2811)
+    time<-system.time(appo<-randomForest(formula(paste("classe ~ ", predictors, sep="")),
+                method="class", mtry=m, data=training, importance =TRUE))
+    nome<-paste("reducVar_", i, sep="")
+    storeResults("RF", appo, nome, time["user.self"])
+    HQAR_rf_reduced[[i]] <- appo
+    }
+
+## variable used to compare the number of variables of reduced RF and customized rpart
+num_var_rpart_in_rf<-sum(names(sort(HQAR_rpartCust$variable.importance, decreasing=TRUE)[1:25]) %in% rownames(varImp(HQAR_rf_reduced[[3]])))
+```
+
+###Results
+
+The following table summarizes the outcomes of each model built in this analysis.
+
+```{r}
+results
+```
+
+All the "randomForest" models produce far better predictions than those of the other two families, at the cost of a much greater complexity reflected also in the computational effort. The supremacy of "RF"
+is also confirmed by the following figure that shows the out-of-sample accuracy of each model and the related confidence interval, calculated making a prediction on the "validation" set.
+
+```{r plotAccuracy, fig.height=4, fig.width=8}
+colori<-c("violetred", "springgreen1", "springgreen4", "steelblue1", "steelblue4", "firebrick2", "yellow3", "yellow4", "tomato", "chocolate4")
+par(mar=c(4,4,2,0))
+plotCI(1:10, results$ValAcc, ui=results$ValAccU, li=results$ValAccL, pt.bg = par("bg"), pch=19, col=colori, xlab="models", ylab="Out-of-sample accuracy", main="Accuracy of different models", ylim=c(0.55, 1.05))
+abline(h = seq(0.6, 1.0, by=0.1), col="grey")
+legend("bottomright", legend=paste(results$Type, results$modName, sep="-"),col=colori, pch=19, ncol=2)
+```
+
+Despite the indiscussed supremacy of the "randomForest" models, also the "rpart" models are quite good, expecially the one with customized parameters, and they are also quite light in terms of computational effort. It is interesting that only `r num_var_rpart_in_rf` out of the `r results[8,4]` variables that, used by the reduced randomForest model, make it achieve the `r paste(round(100*results[8,9],2),"%", sep="")` accuracy, are among the first 25 most important predictors of the "rpart-custom" model.
+
+
+###Conclusions
+
+The best model, selected to predict the 20 test cases, is the randomForest with all the 53 indepedent variables, whose confusion matrix and error plot are reported hereafter.
+
+```{r plot, fig.height=4, fig.width=8}
+HQAR_rf$confusion
+
+## plot the error rate for OOB and each of the 5 classes
+par(mar=c(5,4,1,0)) #No margin on the right side
+plot(HQAR_rf, log="y")
+legend("topright", colnames(HQAR_rf$err.rate),col=1:6,cex=0.8,fill=1:6)
+```
+
+In any case, both effort and complexity of the randomForest model can be contained reducing the number of predictors from 53 to those whose importance is above a reasonable threshold.
+
+Looking at "results", it appears that, at least for this specific problem, the accuracy of a randomForest model is still very good (above 99%) even considering about 40% of the total independent variables, as per the third reduced model that uses only `r results[8,"VarsImp"]`  out of 53 total predictors, namely:
+
+```{r}
+rownames(varImp(HQAR_rf_reduced[[3]]))
+```
+
+Hereafter is reported the confusion matrix of the third reduced randomForest model, accompanied by the figures with the relevant error rates for increasing number of trees: it is evident that the results are not far from those of the more complex and computationally heavy model with all the predictors.
+
+```{r plot1, fig.height=4, fig.width=8}
+HQAR_rf_reduced[[3]]$confusion
+
+## plot the error rate for OOB and each of the 5 classes
+## layout(matrix(c(1,2),nrow=2), width=c(2,1))
+par(mar=c(5,4,1,0)) #No margin on the right side
+plot(HQAR_rf_reduced[[3]], log="y")
+legend("topright", colnames(HQAR_rf$err.rate),col=1:6,cex=0.8,fill=1:6)
+```
+
+
+###Prediction of testing set outcomes
+
+The following table reports the predictions made using the 10 identified models on the 20 testing cases
+
+``` {r show_important_vars}
+
+rf_bag_test<-as.character(predict(HQAR_bagging, testing, type="class"))
+rf_test<-as.character(predict(HQAR_rf, testing, type="class"))
+rf_red1_test<-as.character(predict(HQAR_rf_reduced[[1]], testing, type="class"))
+rf_red2_test<-as.character(predict(HQAR_rf_reduced[[2]], testing, type="class"))
+rf_red3_test<-as.character(predict(HQAR_rf_reduced[[3]], testing, type="class"))
+rf_red4_test<-as.character(predict(HQAR_rf_reduced[[4]], testing, type="class"))
+rf_red5_test<-as.character(predict(HQAR_rf_reduced[[5]], testing, type="class"))
+rpartcust_test<-as.character(predict(HQAR_rpartCust, testing, type="class"))
+rpart_test<-as.character(predict(HQAR_rpart, testing, type="class"))
+tree_test<-as.character(predict(HQAR_tree, testing, type="class"))
+test_results<-rbind(tree_test, rpart_test, rpartcust_test, rf_bag_test, rf_test, rf_red1_test, rf_red2_test, rf_red3_test, rf_red4_test, rf_red5_test)
+test_results
+```
+
+It is noteworthy that all the 7 models of randomForest family predict the same outcome for all 20 cases, confirming their accuracy; also the predictions of the rpart customized model are almost the same, with only few differences.
